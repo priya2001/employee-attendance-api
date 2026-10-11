@@ -41,6 +41,20 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def to_epoch_millis(value: datetime) -> int:
+    # PyMongo's default naive datetimes represent UTC, not the host's local time.
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    elapsed = value.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (elapsed.days * 86400 + elapsed.seconds) * 1000 + elapsed.microseconds // 1000
+
+
+def serialize_employee(doc: dict) -> dict:
+    result = {key: value for key, value in doc.items() if key != "_id"}
+    result["created_at"] = to_epoch_millis(doc["created_at"])
+    return result
+
+
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -105,13 +119,12 @@ def health():
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
+    doc["created_at"] = datetime.now(timezone.utc).replace(microsecond=0)
     try:
         db.employees.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "emp_code already exists") from None
-    doc.pop("_id", None)
-    return doc
+    return serialize_employee(doc)
 
 
 @app.get("/employees")
@@ -131,7 +144,7 @@ def list_employees(
         .skip(skip)
         .limit(page_size)
     )
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    return {"items": [serialize_employee(doc) for doc in items], "total": total, "page": page, "page_size": page_size}
 
 
 @app.post("/attendance/punch-in", status_code=201)
