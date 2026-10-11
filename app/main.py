@@ -56,6 +56,40 @@ def serialize_employee(doc: dict) -> dict:
     return result
 
 
+def serialize_attendance(doc: dict) -> dict:
+    def instant(value):
+        return to_epoch_millis(value) if value is not None else None
+
+    history = []
+    for entry in doc.get("history", []):
+        changes = {}
+        for field, change in entry["changes"].items():
+            changes[field] = {
+                direction: instant(value) if field in ("punch_in", "punch_out") else value
+                for direction, value in change.items()
+            }
+        history.append({
+            "at": instant(entry["at"]),
+            "by": entry["by"],
+            "reason": entry["reason"],
+            "changes": changes,
+        })
+
+    # Build an API-only copy; stored BSON dates and audit entries stay unchanged.
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": instant(doc.get("punch_in")),
+        "punch_out": instant(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes", 0),
+        "overtime_minutes": doc.get("overtime_minutes", 0),
+        "half_day": doc.get("half_day", False),
+        "history": history,
+    }
+
+
 def normalize_instant(value: datetime) -> datetime:
     # Naive BSON dates returned by PyMongo are UTC.
     if value.tzinfo is None:
@@ -191,12 +225,10 @@ def punch_in(body: PunchInIn):
         "history": [],
     }
     try:
-        res = db.attendance_logs.insert_one(doc)
+        db.attendance_logs.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "already punched in for this date") from None
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    return serialize_attendance(doc)
 
 
 @app.get("/attendance")
@@ -223,9 +255,12 @@ def list_attendance(
     docs.sort(key=lambda d: d["date"], reverse=True)
     total = len(docs)
     page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    return {
+        "items": [serialize_attendance(doc) for doc in page_docs],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 # --------------------------------------------------------------------------- #
