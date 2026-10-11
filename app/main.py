@@ -33,6 +33,8 @@ IST = timezone(timedelta(hours=5, minutes=30))
 async def lifespan(app: FastAPI):
     # MongoDB enforces uniqueness even when multiple requests arrive together.
     db.employees.create_index("emp_code", unique=True)
+    db.employees.create_index([("joined_on", 1), ("department", 1)])
+    db.employees.create_index([("department", 1), ("joined_on", 1)])
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
     db.attendance_logs.create_index([("status", 1), ("date", -1), ("emp_code", 1)])
@@ -537,9 +539,71 @@ def employee_monthly(emp_code: str, month: CalendarMonth):
     return result
 
 
+def department_summary_pipeline(month: str, department: Optional[str] = None):
+    year, number = map(int, month.split("-"))
+    first = month + "-01"
+    last = f"{month}-{calendar.monthrange(year, number)[1]:02d}"
+    employees = {"joined_on": {"$lte": last}}
+    if department is not None:
+        employees["department"] = department
+    present = {"$in": ["$status", PRESENCE_STATUSES]}
+    weekday = {"$lte": [{"$isoDayOfWeek": {
+        "date": {"$dateFromString": {"dateString": "$date", "timezone": "+05:30"}},
+        "timezone": "+05:30",
+    }}, 5]}
+    has_hours = {"$and": [present, {"$ne": [{"$ifNull": ["$work_hours", None]}, None]}]}
+    late = {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}
+    metrics = {
+        "present_days": {"$sum": {"$cond": [
+            {"$and": [present, weekday]},
+            {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]}, 0,
+        ]}},
+        "hours_sum": {"$sum": {"$cond": [has_hours, {"$toDecimal": "$work_hours"}, 0]}},
+        "hours_count": {"$sum": {"$cond": [has_hours, 1, 0]}},
+        "late_count": {"$sum": {"$cond": [late, 1, 0]}},
+        "total_late_minutes": {"$sum": {"$cond": [late, "$late_minutes", 0]}},
+        "leave_count": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+        "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]}},
+    }
+    pipeline = [
+        {"$match": employees},
+        # Start from employees: each contributes one headcount even with no logs.
+        {"$lookup": {
+            "from": "attendance_logs", "let": {"code": "$emp_code"},
+            "pipeline": [
+                {"$match": {"date": {"$gte": first, "$lte": last},
+                            "$expr": {"$eq": ["$emp_code", "$$code"]}}},
+                {"$group": {"_id": None, **metrics}},
+            ], "as": "summary",
+        }},
+        {"$set": {"summary": {"$arrayElemAt": ["$summary", 0]}}},
+        {"$group": {
+            "_id": "$department", "headcount": {"$sum": 1},
+            **{field: {"$sum": {"$ifNull": [f"$summary.{field}", 0]}} for field in metrics},
+        }},
+        {"$project": {
+            "_id": 0, "department": "$_id", "headcount": 1, "present_days": 1,
+            "late_count": 1, "total_late_minutes": 1, "leave_count": 1, "on_duty_count": 1,
+            # Combine sums/counts before division, never average employee averages.
+            "avg_work_hours": {"$cond": [
+                {"$gt": ["$hours_count", 0]},
+                aggregation_half_up({"$divide": ["$hours_sum", "$hours_count"]}), None,
+            ]},
+        }},
+        {"$sort": {"department": 1}},
+    ]
+    index = "department_1_joined_on_1" if department is not None else "joined_on_1_department_1"
+    return pipeline, index
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: CalendarMonth, department: Optional[str] = None):
+    pipeline, index = department_summary_pipeline(month, department)
+    return {"month": month, "items": list(db.employees.aggregate(pipeline, hint=index))}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
