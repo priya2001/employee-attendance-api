@@ -602,9 +602,58 @@ def department_summary(month: CalendarMonth, department: Optional[str] = None):
     return {"month": month, "items": list(db.employees.aggregate(pipeline, hint=index))}
 
 
+def late_leaderboard_pipeline(month: str, limit: int, department: Optional[str] = None):
+    year, number = map(int, month.split("-"))
+    first = month + "-01"
+    last = f"{month}-{calendar.monthrange(year, number)[1]:02d}"
+    pipeline = [
+        {"$match": {"date": {"$gte": first, "$lte": last}}},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [
+                {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0,
+            ]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$lookup": {
+            "from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "employee",
+        }},
+        # Unwind removes orphan logs before they can affect anyone's rank.
+        {"$unwind": "$employee"},
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"employee.department": department}})
+    pipeline.extend([
+        {"$setWindowFields": {
+            # Only lateness determines rank; adding employee code would break ties.
+            "sortBy": {"total_late_minutes": -1},
+            "output": {"rank": {"$rank": {}}},
+        }},
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$project": {
+            "_id": 0, "rank": 1, "emp_code": "$_id", "name": "$employee.name",
+            "department": "$employee.department", "total_late_minutes": 1, "late_count": 1,
+        }},
+        {"$sort": {"total_late_minutes": -1, "emp_code": 1}},
+    ])
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: CalendarMonth,
+    limit: int = Query(default=10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    pipeline = late_leaderboard_pipeline(month, limit, department)
+    return {"month": month, "items": list(db.attendance_logs.aggregate(
+        pipeline, hint="date_-1_emp_code_1",
+    ))}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
