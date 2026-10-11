@@ -1,7 +1,11 @@
-# DECISIONS.md  (about 150-200 words in total - plain language, your own words)
+# Decisions
 
-1. **Indexes.** Which indexes did you create, and which query or guarantee does each one serve? Which one did you consider and reject?
-2. **Punch-in race.** Two identical punch-in requests arrive at the same instant. Walk through exactly what happens in your code.
-3. **Ties.** Two employees are tied on late minutes at the cutoff of `limit`. What does your leaderboard return, and why?
-4. **Headcount.** How does your department summary make sure employees with zero logs are counted?
-5. **One thing you would change** if this had to serve 100x the data.
+1. **Indexes.** Unique employee `emp_code` and attendance `(emp_code, date)` indexes enforce identity. Attendance `(date descending, emp_code)` supports listing and monthly leaderboard scans; `(status, date descending, emp_code)` supports status-filtered pages. `(emp_code, punch_in descending)` finds the latest eligible punch. Employee `(joined_on, department)` and `(department, joined_on)` support period headcounts and department queries. Employee-code indexes also support joins. I rejected a standalone status index: it would not provide the required date ordering.
+
+2. **Punch-in race.** Both requests validate input, load the employee and calculate the attendance date. Each attempts an insert. MongoDB's unique compound index allows one insert. That request returns 201; the other catches DuplicateKeyError and returns 409. A preliminary existence check is unnecessary.
+
+3. **Ties.** MongoDB ranks total lateness before filtering rank <= limit. Tied employees share a rank; later ranks skip positions. All cutoff ties remain, ordered by employee code.
+
+4. **Headcount.** Department summaries start from employees who joined by month-end. Each contributes one headcount even when its attendance lookup is empty.
+
+5. **At 100x data.** Maintain daily employee summaries incrementally, including corrections, to reduce repeated aggregation work. Keep raw logs as the audit source and measure query plans before changing indexes.

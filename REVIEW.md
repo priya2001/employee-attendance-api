@@ -1,6 +1,6 @@
-# REVIEW.md
+# Starter review
 
-List every defect you found in the starter `app/main.py` (helpers and endpoints). For each one:
+The table records defects found in the supplied starter and their implemented fixes.
 
 | # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
 |---|---|---|---|---|
@@ -43,4 +43,28 @@ Late leaderboard verification: 12 report/filter/limit cases plus an empty collec
 
 Department trend verification: 11 date-series cases matched independently calculated rows, including gaps, zero logs, daily joining headcount, weekend/half-day counts, short and rolling windows, all-null rates, leap/year boundaries, and an inclusive 92-day range. Six invalid range requests returned 422; unknown and case-mismatched departments returned 404. Exact half-up ties for rates and moving averages passed. Explain used indexed root and nested lookups with no collection scans; the pipeline uses $densify and $setWindowFields.
 
-Admin explain verification: nine real MongoDB requests covered all five supported operations and optional filters. Compared dispatched queries/pipelines, hints, sorting, projection and pagination against the corresponding endpoint builders; checked executionStats, indexed plans, BSON JSON serialization and paginated returned-row counts. Sixteen invalid/missing parameter cases returned 422 before database access. All tested plans contained IXSCAN and no COLLSCAN; 100k-record performance validation remains pending.
+Admin explain verification: nine real MongoDB requests covered all five supported operations and optional filters. Compared dispatched queries/pipelines, hints, sorting, projection and pagination against the corresponding endpoint builders; checked executionStats, indexed plans, BSON JSON serialization and paginated returned-row counts. Sixteen invalid/missing parameter cases returned 422 before database access. All tested plans contained IXSCAN and no COLLSCAN. The final large-dataset checks are recorded below.
+
+## Final verification — 12 October 2026
+
+Used isolated temporary databases and separate test servers. The supplied sample database was not modified. Test databases were dropped and test servers stopped afterward.
+
+- Loaded 100,000 attendance records and 570 employees, including 50 mid-month no-log joiners and 20 future joiners. Started with only MongoDB's default indexes, so application startup created every required index.
+- Compared listing pages and employee, department, leaderboard and 92-day trend results against independently calculated expectations.
+- Checked eight explain variants across all five supported operations: IXSCAN present, COLLSCAN absent, and reported nested collectionScans equal to zero.
+- Exercised eight-way HTTP races for employee creation, punch-in and punch-out. Each produced exactly one successful request; conflicts returned 409. The separate correction regression forced eight requests to read the same snapshot, yielding one 200 and seven 409 with one audit entry.
+- Completed an HTTP create → punch-in → punch-out → correction → listing → monthly-report workflow, and verified unavailable-database health handling returns 503.
+- Reran correction, monthly, department-summary, leaderboard, trend and explain regression suites against MongoDB 7.0.26, using a clean Git archive and a fresh virtual environment with requirements installed from scratch. Also checked the existing environment against MongoDB 8.2.7. Python was 3.14.4 in both runs; Python 3.11 itself was not separately executed.
+
+Example single-run timings on the local Apple Silicon machine, MongoDB 7.0.26, 100k records (not a production latency guarantee):
+
+| Operation | Time |
+|---|---:|
+| Readiness, including startup index creation | 2.221 s |
+| Attendance page variants, including a deep page | 5–39 ms |
+| Employee monthly report variants | 1–9 ms |
+| All-department monthly summary | 117 ms |
+| Late leaderboard variants | 26–28 ms |
+| Department trend, 92 calendar days | 817 ms |
+
+Fresh dependency installation exposed an obsolete `pymongo[srv]` extra warning. Requirements now declare PyMongo and dnspython explicitly, retaining SRV connection support without relying on that extra. No application behaviour changed during final verification. Hidden grading data/tests remain unavailable.
