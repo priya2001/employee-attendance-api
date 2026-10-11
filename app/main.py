@@ -9,6 +9,7 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import calendar
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -443,9 +444,101 @@ def list_attendance(
     }
 
 
+def validate_month(value: str) -> str:
+    date.fromisoformat(value + "-01")
+    return value
+
+
+CalendarMonth = Annotated[
+    str, Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$"), AfterValidator(validate_month)
+]
+PRESENCE_STATUSES = ["PRESENT", "WFH", "ON_DUTY"]
+
+
+def aggregation_half_up(value, places=2):
+    # Metrics are nonnegative. Decimal arithmetic avoids binary float rounding
+    # and MongoDB $round's ties-to-even behaviour.
+    scale = 10 ** places
+    return {"$toDouble": {"$divide": [
+        {"$floor": {"$add": [
+            {"$multiply": [{"$toDecimal": value}, scale]},
+            {"$toDecimal": "0.5"},
+        ]}}, scale,
+    ]}}
+
+
+def employee_monthly_pipeline(emp_code: str, month: str):
+    year, month_number = map(int, month.split("-"))
+    first = month + "-01"
+    last = f"{month}-{calendar.monthrange(year, month_number)[1]:02d}"
+    date_value = {"$dateFromString": {"dateString": "$date", "timezone": "+05:30"}}
+    is_weekday = {"$lte": [{"$isoDayOfWeek": {"date": date_value, "timezone": "+05:30"}}, 5]}
+    start = {"$dateFromString": {
+        "dateString": {"$cond": [{"$gt": ["$joined_on", first]}, "$joined_on", first]},
+        "timezone": "+05:30",
+    }}
+    end = {"$dateFromString": {"dateString": last, "timezone": "+05:30"}}
+    return [
+        {"$match": {"emp_code": emp_code}},
+        {"$lookup": {
+            "from": "attendance_logs", "let": {"code": "$emp_code"},
+            "pipeline": [
+                {"$match": {
+                    "date": {"$gte": first, "$lte": last},
+                    "$expr": {"$eq": ["$emp_code", "$$code"]},
+                }},
+                {"$group": {
+                    "_id": None,
+                    "present_days": {"$sum": {"$cond": [
+                        {"$and": [{"$in": ["$status", PRESENCE_STATUSES]}, is_weekday]},
+                        {"$cond": [{"$ifNull": ["$half_day", False]}, 0.5, 1]}, 0,
+                    ]}},
+                    "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+                    "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+                    "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+                    "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+                }},
+            ], "as": "summary",
+        }},
+        {"$set": {"summary": {"$arrayElemAt": ["$summary", 0]}, "period_start": start}},
+        {"$set": {"working_days": {"$size": {"$filter": {
+            "input": {"$range": [0, {"$max": [0, {"$add": [
+                {"$dateDiff": {"startDate": "$period_start", "endDate": end,
+                               "unit": "day", "timezone": "+05:30"}}, 1,
+            ]}]}]},
+            "as": "offset",
+            "cond": {"$lte": [{"$isoDayOfWeek": {
+                "date": {"$dateAdd": {"startDate": "$period_start", "unit": "day", "amount": "$$offset"}},
+                "timezone": "+05:30",
+            }}, 5]},
+        }}}}},
+        {"$project": {
+            "_id": 0, "emp_code": 1, "month": {"$literal": month}, "working_days": 1,
+            "present_days": {"$ifNull": ["$summary.present_days", 0]},
+            "leave_days": {"$ifNull": ["$summary.leave_days", 0]},
+            "late_count": {"$ifNull": ["$summary.late_count", 0]},
+            "total_late_minutes": {"$ifNull": ["$summary.total_late_minutes", 0]},
+            "total_overtime_minutes": {"$ifNull": ["$summary.total_overtime_minutes", 0]},
+        }},
+        {"$set": {"attendance_pct": {"$cond": [
+            {"$gt": ["$working_days", 0]},
+            aggregation_half_up({"$divide": [
+                {"$multiply": [{"$toDecimal": "$present_days"}, 100]}, "$working_days",
+            ]}), None,
+        ]}}},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: CalendarMonth):
+    result = next(db.employees.aggregate(employee_monthly_pipeline(emp_code, month)), None)
+    if result is None:
+        raise HTTPException(404, "employee not found")
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
 #   GET   /analytics/departments/{department}/trend
