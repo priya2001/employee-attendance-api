@@ -55,11 +55,29 @@ def serialize_employee(doc: dict) -> dict:
     return result
 
 
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+def normalize_instant(value: datetime) -> datetime:
+    # Naive BSON dates returned by PyMongo are UTC.
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str:
+    local = normalize_instant(punch_in).astimezone(IST)
+    day = local.date()
+    end_hour, end_minute = map(int, shift_end.split(":"))
+    before_shift_end = (local.hour, local.minute, local.second) < (end_hour, end_minute, 0)
+    if shift_end <= shift_start and before_shift_end:
+        day -= timedelta(days=1)
+    return day.isoformat()
+
+
+def compute_late_minutes(punch_in: datetime, shift_start: str, date_str: str) -> int:
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+    start = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
+    seconds = int((normalize_instant(punch_in) - start).total_seconds())
+    # Compare seconds before flooring, so 10:01 late reports 10 minutes.
+    return seconds // 60 if seconds > 10 * 60 else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -157,8 +175,8 @@ def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if emp is None:
         raise HTTPException(404, "employee not found")
-    ts = datetime.fromtimestamp(body.punched_at / 1000)
-    d = ts.date().isoformat()
+    ts = datetime.fromtimestamp(body.punched_at // 1000, tz=timezone.utc)
+    d = attendance_date(ts, emp["shift_start"], emp["shift_end"])
     if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
         raise HTTPException(409, "already punched in for this date")
     doc = {
@@ -168,7 +186,7 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"], d),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
