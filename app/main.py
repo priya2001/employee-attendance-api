@@ -11,13 +11,14 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
@@ -34,6 +35,7 @@ async def lifespan(app: FastAPI):
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
     db.attendance_logs.create_index([("status", 1), ("date", -1), ("emp_code", 1)])
+    db.attendance_logs.create_index([("emp_code", 1), ("punch_in", -1)])
     yield
 
 
@@ -119,13 +121,17 @@ def compute_late_minutes(punch_in: datetime, shift_start: str, date_str: str) ->
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    seconds = int((normalize_instant(punch_out) - normalize_instant(punch_in)).total_seconds())
+    return float((Decimal(seconds) / Decimal(3600)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
+def compute_overtime(punch_out: datetime, shift_start: str, shift_end: str, date_str: str) -> int:
     h, m = map(int, shift_end.split(":"))
     end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+    if shift_end <= shift_start:
+        end += timedelta(days=1)
+    minutes = int((normalize_instant(punch_out) - end).total_seconds()) // 60
+    return minutes if minutes >= 30 else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +160,7 @@ class EmployeeIn(BaseModel):
         return self
 
 
-class PunchInIn(BaseModel):
+class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: int = Field(
         default_factory=lambda: to_epoch_millis(datetime.now(timezone.utc)),
@@ -162,6 +168,9 @@ class PunchInIn(BaseModel):
         ge=100000000000,
         le=4102444800000,
     )
+
+
+class PunchInIn(PunchOutIn):
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
@@ -234,6 +243,52 @@ def punch_in(body: PunchInIn):
     return serialize_attendance(doc)
 
 
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = datetime.fromtimestamp(body.punched_at // 1000, tz=timezone.utc)
+    # Select the latest eligible punch, including closed records; do not skip
+    # a closed recent shift to accidentally close an older open one.
+    record = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$type": "date", "$lte": ts}},
+        sort=[("punch_in", -1)],
+    )
+    if record is None:
+        raise HTTPException(404, "no punch-in found")
+    if record.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+    elapsed = (ts - normalize_instant(record["punch_in"])).total_seconds()
+    if elapsed <= 0 or elapsed > 24 * 60 * 60:
+        raise RequestValidationError([{
+            "type": "value_error",
+            "loc": ("body", "punched_at"),
+            "msg": "punch-out must be after punch-in and within 24 hours",
+            "input": body.punched_at,
+        }])
+    hours = compute_work_hours(record["punch_in"], ts)
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "_id": record["_id"],
+            "punch_out": None,
+            "punch_in": record["punch_in"],
+            "status": record["status"],
+            "history": record.get("history"),
+        },
+        {"$set": {
+            "punch_out": ts,
+            "work_hours": hours,
+            "overtime_minutes": compute_overtime(ts, emp["shift_start"], emp["shift_end"], record["date"]),
+            "half_day": hours < 4.50,
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "attendance record changed; retry the request")
+    return serialize_attendance(updated)
+
+
 def validate_calendar_date(value: str) -> str:
     date.fromisoformat(value)
     return value
@@ -300,7 +355,6 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
