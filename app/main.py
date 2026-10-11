@@ -11,11 +11,12 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator, model_validator
+from fastapi.exceptions import RequestValidationError
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -31,6 +32,8 @@ async def lifespan(app: FastAPI):
     # MongoDB enforces uniqueness even when multiple requests arrive together.
     db.employees.create_index("emp_code", unique=True)
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+    db.attendance_logs.create_index([("status", 1), ("date", -1), ("emp_code", 1)])
     yield
 
 
@@ -231,30 +234,62 @@ def punch_in(body: PunchInIn):
     return serialize_attendance(doc)
 
 
+def validate_calendar_date(value: str) -> str:
+    date.fromisoformat(value)
+    return value
+
+
+CalendarDate = Annotated[
+    str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$"), AfterValidator(validate_calendar_date)
+]
+AttendanceStatus = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+ATTENDANCE_SORT = [("date", -1), ("emp_code", 1)]
+
+
+def attendance_list_query(emp_code, date_from, date_to, status):
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise RequestValidationError([{
+            "type": "value_error",
+            "loc": ("query", "date_to"),
+            "msg": "date_to must be on or after date_from",
+            "input": date_to,
+        }])
+    query = {}
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        query["date"] = {}
+        if date_from is not None:
+            query["date"]["$gte"] = date_from
+        if date_to is not None:
+            query["date"]["$lte"] = date_to
+    if status is not None:
+        query["status"] = status
+    # Equality on employee or status leaves an indexed date order for pagination.
+    index = "emp_code_1_date_1" if emp_code is not None else (
+        "status_1_date_-1_emp_code_1" if status is not None else "date_-1_emp_code_1"
+    )
+    return query, index
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    date_from: Optional[CalendarDate] = None,
+    date_to: Optional[CalendarDate] = None,
+    status: Optional[AttendanceStatus] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ):
-    q = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
+    query, index = attendance_list_query(emp_code, date_from, date_to, status)
+    total = db.attendance_logs.count_documents(query, hint=index)
+    page_docs = (
+        db.attendance_logs.find(query, {"_id": 0})
+        .sort(ATTENDANCE_SORT)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+        .hint(index)
+    )
     return {
         "items": [serialize_attendance(doc) for doc in page_docs],
         "total": total,
