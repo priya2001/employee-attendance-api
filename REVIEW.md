@@ -31,4 +31,6 @@ List every defect you found in the starter `app/main.py` (helpers and endpoints)
 | 25 | `compute_work_hours()` | Used binary float/banker's rounding instead of half-up and did not normalize BSON/aware datetimes. | A 4-hour 29-minute 42-second duration is exactly 4.495 hours and must round to 4.50 (not a half day); 18 seconds must round to 0.01. | Normalize whole-second UTC instants and use Decimal arithmetic with ROUND_HALF_UP. |
 | 26 | `compute_overtime()` | Counted overtime below 30 minutes, used the wrong end date for overnight shifts, and mixed naive and aware datetimes. | Check 29:59 versus 30:00 after shift end and 06:40 after a 22:00-06:00 shift. | Anchor shift end in IST on the attendance date (next day for overnight shifts), normalize the punch, floor minutes and enforce the 30-minute threshold. |
 
-Also note anything you looked at and decided was **not** a defect, and why.
+Not defects: omitted `history` and `half_day` in seeded legacy records are permitted by the data model and mean `[]` and `false`. Punch-in and punch-out must not append correction history; only the PATCH endpoint does so.
+
+Regularization verification: tested status transitions, omitted versus null inputs, date and duration validation, half-up boundaries, nested BSON/HTTP timestamp conversion, exact changed-field history, and legacy records. Eight synchronized corrections reading the same record produced one 200 and seven 409 responses, with exactly one appended history entry. Sequential successful corrections preserved earlier entries.

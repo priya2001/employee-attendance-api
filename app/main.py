@@ -301,6 +301,96 @@ AttendanceStatus = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 ATTENDANCE_SORT = [("date", -1), ("emp_code", 1)]
 
 
+class RegularizeIn(BaseModel):
+    status: Optional[AttendanceStatus] = None
+    punch_in: Optional[int] = Field(default=None, strict=True, ge=100000000000, le=4102444800000)
+    punch_out: Optional[int] = Field(default=None, strict=True, ge=100000000000, le=4102444800000)
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+    @field_validator("status", "punch_in", "punch_out")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        # Omission keeps the stored value; explicit null is not in the contract.
+        if value is None:
+            raise ValueError("omit this field instead of sending null")
+        return value
+
+
+def correction_error(field: str, message: str):
+    raise RequestValidationError([{
+        "type": "value_error", "loc": ("body", field), "msg": message,
+    }])
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: CalendarDate, body: RegularizeIn):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if record is None:
+        raise HTTPException(404, "attendance record not found")
+
+    defaults = {"punch_in": None, "punch_out": None, "work_hours": None,
+                "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    before = {"status": record["status"], **{
+        field: record.get(field, default) for field, default in defaults.items()
+    }}
+    # Compare aware UTC values with BSON dates without altering audit originals.
+    for field in ("punch_in", "punch_out"):
+        value = before[field]
+        if value is not None:
+            before[field] = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    final = before.copy()
+    supplied = body.model_fields_set
+    if "status" in supplied:
+        final["status"] = body.status
+    for field in ("punch_in", "punch_out"):
+        if field in supplied:
+            final[field] = datetime.fromtimestamp(getattr(body, field) // 1000, tz=timezone.utc)
+        elif final[field] is not None:
+            final[field] = normalize_instant(final[field])
+
+    if final["status"] in ("ABSENT", "LEAVE"):
+        if supplied & {"punch_in", "punch_out"}:
+            correction_error("status", "ABSENT or LEAVE cannot include punch times")
+        final.update(defaults)
+    else:
+        if final["punch_in"] is None:
+            correction_error("punch_in", "a presence status requires punch_in")
+        if attendance_date(final["punch_in"], emp["shift_start"], emp["shift_end"]) != date:
+            correction_error("punch_in", "punch_in must remain on the record's attendance date")
+        final["late_minutes"] = compute_late_minutes(final["punch_in"], emp["shift_start"], date)
+        final.update(work_hours=None, overtime_minutes=0, half_day=False)
+        if final["punch_out"] is not None:
+            seconds = (final["punch_out"] - final["punch_in"]).total_seconds()
+            if seconds <= 0 or seconds > 86400:
+                correction_error("punch_out", "punch_out must be after punch_in and within 24 hours")
+            final["work_hours"] = compute_work_hours(final["punch_in"], final["punch_out"])
+            final["overtime_minutes"] = compute_overtime(final["punch_out"], emp["shift_start"], emp["shift_end"], date)
+            final["half_day"] = final["work_hours"] < 4.50
+
+    changes = {field: {"from": before[field], "to": value}
+               for field, value in final.items() if value != before[field]}
+    if not changes:
+        correction_error("body", "correction must change at least one field")
+    entry = {"at": datetime.now(timezone.utc).replace(microsecond=0),
+             "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    # Compare the snapshot and append atomically: stale edits cannot overwrite
+    # a concurrent correction or punch-out, or lose its history entry.
+    expected = {"_id": record["_id"], **{
+        field: record.get(field) for field in (*final, "history")
+    }}
+    updated = db.attendance_logs.find_one_and_update(
+        expected, {"$set": final, "$push": {"history": entry}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "attendance record changed; retry the request")
+    return serialize_attendance(updated)
+
+
 def attendance_list_query(emp_code, date_from, date_to, status):
     if date_from is not None and date_to is not None and date_from > date_to:
         raise RequestValidationError([{
@@ -355,7 +445,6 @@ def list_attendance(
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
