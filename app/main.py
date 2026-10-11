@@ -30,6 +30,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 async def lifespan(app: FastAPI):
     # MongoDB enforces uniqueness even when multiple requests arrive together.
     db.employees.create_index("emp_code", unique=True)
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     yield
 
 
@@ -177,8 +178,6 @@ def punch_in(body: PunchInIn):
         raise HTTPException(404, "employee not found")
     ts = datetime.fromtimestamp(body.punched_at // 1000, tz=timezone.utc)
     d = attendance_date(ts, emp["shift_start"], emp["shift_end"])
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -191,7 +190,10 @@ def punch_in(body: PunchInIn):
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
+    try:
+        res = db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date") from None
     doc["id"] = str(res.inserted_id)
     doc.pop("_id", None)
     return doc
