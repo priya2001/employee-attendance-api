@@ -9,12 +9,14 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import json
 import calendar
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
@@ -743,7 +745,65 @@ def department_trend(
     ))}
 
 
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
+ExplainEndpoint = Literal[
+    "attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"
+]
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainEndpoint,
+    emp_code: Optional[str] = None,
+    month: Optional[CalendarMonth] = None,
+    department: Optional[str] = None,
+    limit: int = Query(default=10, ge=1, le=50),
+    date_from: Optional[CalendarDate] = None,
+    date_to: Optional[CalendarDate] = None,
+    status: Optional[AttendanceStatus] = None,
+    trend_from: Annotated[Optional[CalendarDate], Query(alias="from")] = None,
+    trend_to: Annotated[Optional[CalendarDate], Query(alias="to")] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    required = {
+        "attendance_list": {},
+        "employee_monthly": {"emp_code": emp_code, "month": month},
+        "department_summary": {"month": month},
+        "late_leaderboard": {"month": month},
+        "department_trend": {"department": department, "from": trend_from, "to": trend_to},
+    }[endpoint]
+    missing = [{"type": "missing", "loc": ("query", name), "msg": "Field required", "input": None}
+               for name, value in required.items() if value is None]
+    if missing:
+        raise RequestValidationError(missing)
+
+    if endpoint == "attendance_list":
+        query, index = attendance_list_query(emp_code, date_from, date_to, status)
+        collection = "attendance_logs"
+        operation = {
+            "find": collection, "filter": query, "projection": {"_id": 0},
+            "sort": dict(ATTENDANCE_SORT), "skip": (page - 1) * page_size,
+            "limit": page_size, "hint": index,
+        }
+    else:
+        collection = "employees"
+        index = None
+        if endpoint == "employee_monthly":
+            pipeline = employee_monthly_pipeline(emp_code, month)
+        elif endpoint == "department_summary":
+            pipeline, index = department_summary_pipeline(month, department)
+        elif endpoint == "late_leaderboard":
+            collection = "attendance_logs"
+            pipeline = late_leaderboard_pipeline(month, limit, department)
+            index = "date_-1_emp_code_1"
+        else:
+            pipeline = department_trend_pipeline(department, trend_from, trend_to)
+            index = "department_1_joined_on_1"
+        operation = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+        if index is not None:
+            operation["hint"] = index
+
+    result = db.command("explain", operation, verbosity="executionStats")
+    # Preserve the full explain tree, encoding BSON-only metadata as Extended JSON.
+    return {"endpoint": endpoint, "collection": collection,
+            "explain": json.loads(json_util.dumps(result))}
